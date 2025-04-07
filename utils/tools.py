@@ -1,9 +1,15 @@
+import collections
 import datetime
 import io
+import itertools
+import os
 import pathlib
 import pickle
+import pipes
 import re
+import sys
 import uuid
+
 
 import gym
 import numpy as np
@@ -19,6 +25,32 @@ class AttrDict(dict):
   __setattr__ = dict.__setitem__
   __getattr__ = dict.__getitem__
 
+
+class AttrDefaultDict(collections.defaultdict):
+
+  __setattr__ = collections.defaultdict.__setitem__
+
+  def __getattr__(self, attr):
+    # Take care that getattr() raises AttributeError, not KeyError.
+    # Required e.g. for hasattr(), deepcopy and OrderedDict.
+    try:
+      return collections.defaultdict.__getitem__(self, attr)
+    except KeyError:
+      raise AttributeError("Attribute %r not found" % attr)
+
+  def rename(self, old, new):
+    self[new] = self.pop(old)
+
+  def get(self, key, default=None):
+    if key not in self:
+      return default
+    return self.__getitem__(key)
+
+  def __getstate__(self):
+    return self
+
+  def __setstate__(self, d):
+    self = d
 
 class Module(tf.Module):
 
@@ -59,11 +91,21 @@ def graph_summary(writer, fn, *args):
       fn(*args)
   return tf.numpy_function(inner, args, [])
 
+def get_string(string):
+  if isinstance(string, str):
+    return string
+  elif isinstance(string, bytes):
+    return string.decode('utf8')
+  elif isinstance(string, np.ndarray):
+    return str(string)
+    # return np.char.decode(string)
 
 def video_summary(name, video, step=None, fps=20):
-  name = name if isinstance(name, str) else name.decode('utf-8')
+  name = get_string(name)
   if np.issubdtype(video.dtype, np.floating):
     video = np.clip(255 * video, 0, 255).astype(np.uint8)
+  if len(video.shape) == 4:
+    video = video[None]
   B, T, H, W, C = video.shape
   try:
     frames = video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
@@ -76,6 +118,16 @@ def video_summary(name, video, step=None, fps=20):
     print('GIF summaries require ffmpeg in $PATH.', e)
     frames = video.transpose((0, 2, 1, 3, 4)).reshape((1, B * H, T * W, C))
     tf.summary.image(name + '/grid', frames, step)
+
+
+def image_summary(name, image, step=None):
+  name = get_string(name)
+  if np.issubdtype(image.dtype, np.floating):
+    image = np.clip(255 * image, 0, 255).astype(np.uint8)
+  if len(image.shape) == 4:
+    B, H, W, C = image.shape
+    image = image.reshape((1, B * H, W, C))
+  tf.summary.image(name, image, step)
 
 
 def encode_gif(frames, fps):
@@ -123,7 +175,7 @@ def simulate(agent, envs, steps=0, episodes=0, state=None):
     promises = [e.step(a, blocking=False) for e, a in zip(envs, action)]
     obs, _, done = zip(*[p()[:3] for p in promises])
     obs = list(obs)
-    done = np.stack(done)
+    done = np.stack(done).astype(np.int32)
     episode += int(done.sum())
     length += 1
     step += (done * length).sum()
@@ -154,12 +206,18 @@ def save_episodes(directory, episodes):
         f2.write(f1.read())
 
 
-def load_episodes(directory, rescan, length=None, balance=False, seed=0):
+def load_episodes(directory, rescan, length=None, balance=False, seed=0, offline_dir=None):
   directory = pathlib.Path(directory).expanduser()
+  if offline_dir is not None:
+    offline_dir = pathlib.Path(offline_dir).expanduser()
   random = np.random.RandomState(seed)
   cache = {}
   while True:
-    for filename in directory.glob('*.npz'):
+    if offline_dir is not None:
+      filenames = itertools.chain(offline_dir.glob('*.npz'), directory.glob('*.npz'))
+    else:
+      filenames = directory.glob('*.npz')
+    for filename in filenames:
       if filename not in cache:
         try:
           with filename.open('rb') as f:
@@ -176,7 +234,7 @@ def load_episodes(directory, rescan, length=None, balance=False, seed=0):
         total = len(next(iter(episode.values())))
         available = total - length
         if available < 1:
-          print(f'Skipped short episode of length {available}.')
+          print(f'Skipped short episode of length {total}, need {length}.')
           continue
         if balance:
           index = min(random.randint(0, total), available)
@@ -184,39 +242,6 @@ def load_episodes(directory, rescan, length=None, balance=False, seed=0):
           index = int(random.randint(0, available))
         episode = {k: v[index: index + length] for k, v in episode.items()}
       yield episode
-
-
-class DummyEnv:
-
-  def __init__(self):
-    self._random = np.random.RandomState(seed=0)
-    self._step = None
-
-  @property
-  def observation_space(self):
-    low = np.zeros([64, 64, 3], dtype=np.uint8)
-    high = 255 * np.ones([64, 64, 3], dtype=np.uint8)
-    spaces = {'image': gym.spaces.Box(low, high)}
-    return gym.spaces.Dict(spaces)
-
-  @property
-  def action_space(self):
-    low = -np.ones([5], dtype=np.float32)
-    high = np.ones([5], dtype=np.float32)
-    return gym.spaces.Box(low, high)
-
-  def reset(self):
-    self._step = 0
-    obs = self.observation_space.sample()
-    return obs
-
-  def step(self, action):
-    obs = self.observation_space.sample()
-    reward = self._random.uniform(0, 1)
-    self._step += 1
-    done = self._step >= 1000
-    info = {}
-    return obs, reward, done, info
 
 
 class SampleDist:
@@ -393,6 +418,7 @@ def args_type(default):
 
 
 def static_scan(fn, inputs, start, reverse=False):
+  # Fold left
   last = start
   outputs = [[] for _ in tf.nest.flatten(start)]
   indices = range(len(tf.nest.flatten(inputs)[0]))
@@ -457,3 +483,31 @@ class Once:
       self._once = False
       return True
     return False
+
+
+def map_dict(fn, d):
+  """takes a dictionary and applies the function to every element"""
+  return type(d)(map(lambda kv: (kv[0], fn(kv[1])), d.items()))
+
+
+def save_cmd(base_dir):
+  if not isinstance(base_dir, pathlib.Path):
+    base_dir = pathlib.Path(base_dir)
+  train_cmd = 'python ' + ' '.join([sys.argv[0]] + [pipes.quote(s) for s in sys.argv[1:]])
+  train_cmd += '\n'
+  print('\n' + '*' * 80)
+  print('Training command:\n' + train_cmd)
+  print('*' * 80 + '\n')
+  with open(base_dir / "cmd.txt", "w") as f:
+    f.write(train_cmd)
+
+
+def save_git(base_dir):
+  # save code revision
+  print('Save git commit and diff to {}/git.txt'.format(base_dir))
+  cmds = ["echo `git rev-parse HEAD` > {}".format(
+    os.path.join(base_dir, 'git.txt')),
+    "git diff >> {}".format(
+      os.path.join(base_dir, 'git.txt'))]
+  print(cmds)
+  os.system("\n".join(cmds))

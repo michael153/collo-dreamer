@@ -20,70 +20,60 @@ from tensorflow_probability import distributions as tfd
 
 sys.path.append(str(pathlib.Path(__file__).parent))
 
-import models
-import tools
-import wrappers
+# import base_agent
+import planning_agent
+from utils import models, tools, wrappers
+from planners import gn_solver
+
+def preprocess(obs, config):
+  dtype = prec.global_policy().compute_dtype
+  obs = obs.copy()
+  with tf.device('cpu:0'):
+    obs['image'] = tf.cast(obs['image'], dtype) / 255.0 - 0.5
+    clip_rewards = dict(none=lambda x: x, tanh=tf.tanh)[config.clip_rewards]
+    obs['reward'] = clip_rewards(obs['reward'])
+  return obs
 
 
-def define_config():
-  config = tools.AttrDict()
-  # General.
-  config.logdir = pathlib.Path('.')
-  config.seed = 0
-  config.steps = 5e6
-  config.eval_every = 1e4
-  config.log_every = 1e3
-  config.log_scalars = True
-  config.log_images = True
-  config.gpu_growth = True
-  config.precision = 16
-  # Environment.
-  config.task = 'dmc_walker_walk'
-  config.envs = 1
-  config.parallel = 'none'
-  config.action_repeat = 2
-  config.time_limit = 1000
-  config.prefill = 5000
-  config.eval_noise = 0.0
-  config.clip_rewards = 'none'
-  # Model.
-  config.deter_size = 200
-  config.stoch_size = 30
-  config.num_units = 400
-  config.dense_act = 'elu'
-  config.cnn_act = 'relu'
-  config.cnn_depth = 32
-  config.pcont = False
-  config.free_nats = 3.0
-  config.kl_scale = 1.0
-  config.pcont_scale = 10.0
-  config.weight_decay = 0.0
-  config.weight_decay_pattern = r'.*'
-  # Training.
-  config.batch_size = 50
-  config.batch_length = 50
-  config.train_every = 1000
-  config.train_steps = 100
-  config.pretrain = 100
-  config.model_lr = 6e-4
-  config.value_lr = 8e-5
-  config.actor_lr = 8e-5
-  config.grad_clip = 100.0
-  config.dataset_balance = False
-  # Behavior.
-  config.discount = 0.99
-  config.disclam = 0.95
-  config.horizon = 15
-  config.action_dist = 'tanh_normal'
-  config.action_init_std = 5.0
-  config.expl = 'additive_gaussian'
-  config.expl_amount = 0.3
-  config.expl_decay = 0.0
-  config.expl_min = 0.0
-  return config
+def count_steps(datadir, config):
+  return tools.count_episodes(datadir)[1] * config.action_repeat
 
 
-class Dreamer(tools.Module):
+def load_dataset(directory, config):
+  episode = next(tools.load_episodes(directory, 1))
+  types = {k: v.dtype for k, v in episode.items()}
+  shapes = {k: (None,) + v.shape[1:] for k, v in episode.items()}
+  print("In load dataset: ", config.train_steps, config.batch_length, config.dataset_balance)
+  generator = lambda: tools.load_episodes(
+      directory, config.train_steps, config.batch_length,
+      config.dataset_balance)
+  dataset = tf.data.Dataset.from_generator(generator, types, shapes)
+  dataset = dataset.batch(config.batch_size, drop_remainder=True)
+  dataset = dataset.map(functools.partial(preprocess, config=config))
+  dataset = dataset.prefetch(10)
+  return dataset
+
+
+def summarize_episode(episode, config, datadir, writer, prefix):
+  episodes, steps = tools.count_episodes(datadir)
+  length = (len(episode['reward']) - 1) * config.action_repeat
+  ret = episode['reward'].sum()
+  print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
+  metrics = [
+      (f'{prefix}/return', float(episode['reward'].sum())),
+      (f'{prefix}/length', len(episode['reward']) - 1),
+      (f'episodes', episodes)]
+  step = count_steps(datadir, config)
+  with (config.logdir / 'metrics.jsonl').open('a') as f:
+    f.write(json.dumps(dict([('step', step)] + metrics)) + '\n')
+  with writer.as_default():  # Env might run in a different thread.
+    tf.summary.experimental.set_step(step)
+    [tf.summary.scalar('sim/' + k, v) for k, v in metrics]
+    if prefix == 'test':
+      tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
+
+
+class Dreamer(planning_agent.PlanningAgent):
 
   def __init__(self, config, datadir, actspace, writer):
     self._c = config
@@ -101,58 +91,19 @@ class Dreamer(tools.Module):
     self._metrics = collections.defaultdict(tf.metrics.Mean)
     self._metrics['expl_amount']  # Create variable for checkpoint.
     self._float = prec.global_policy().compute_dtype
-    self._strategy = tf.distribute.MirroredStrategy()
-    with self._strategy.scope():
-      self._dataset = iter(self._strategy.experimental_distribute_dataset(
-          load_dataset(datadir, self._c)))
-      self._build_model()
-
-  def __call__(self, obs, reset, state=None, training=True):
-    step = self._step.numpy().item()
-    tf.summary.experimental.set_step(step)
-    if state is not None and reset.any():
-      mask = tf.cast(1 - reset, self._float)[:, None]
-      state = tf.nest.map_structure(lambda x: x * mask, state)
-    if self._should_train(step):
-      log = self._should_log(step)
-      n = self._c.pretrain if self._should_pretrain() else self._c.train_steps
-      print(f'Training for {n} steps.')
-      with self._strategy.scope():
-        for train_step in range(n):
-          log_images = self._c.log_images and log and train_step == 0
-          self.train(next(self._dataset), log_images)
-      if log:
-        self._write_summaries()
-    action, state = self.policy(obs, state, training)
-    if training:
-      self._step.assign_add(len(reset) * self._c.action_repeat)
-    return action, state
-
-  @tf.function
-  def policy(self, obs, state, training):
-    if state is None:
-      latent = self._dynamics.initial(len(obs['image']))
-      action = tf.zeros((len(obs['image']), self._actdim), self._float)
-    else:
-      latent, action = state
-    embed = self._encode(preprocess(obs, self._c))
-    latent, _ = self._dynamics.obs_step(latent, action, embed)
-    feat = self._dynamics.get_feat(latent)
-    if training:
-      action = self._actor(feat).sample()
-    else:
-      action = self._actor(feat).mode()
-    action = self._exploration(action, training)
-    state = (latent, action)
-    return action, state
-
-  def load(self, filename):
-    super().load(filename)
-    self._should_pretrain()
+    # self._strategy = tf.distribute.MirroredStrategy()
+    # with self._strategy.scope():
+    #   self._dataset = iter(self._strategy.experimental_distribute_dataset(
+    #       load_dataset(datadir, self._c)))
+    #   self._build_model()
+    self._strategy = None
+    self._dataset = iter(load_dataset(datadir, self._c))
+    self._build_model()
 
   @tf.function()
   def train(self, data, log_images=False):
-    self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    # self._strategy.experimental_run_v2(self._train, args=(data, log_images))
+    self._train(data, log_images)
 
   def _train(self, data, log_images):
     with tf.GradientTape() as model_tape:
@@ -174,40 +125,50 @@ class Dreamer(tools.Module):
       div = tf.reduce_mean(tfd.kl_divergence(post_dist, prior_dist))
       div = tf.maximum(div, self._c.free_nats)
       model_loss = self._c.kl_scale * div - sum(likes.values())
-      model_loss /= float(self._strategy.num_replicas_in_sync)
+      # model_loss /= float(self._strategy.num_replicas_in_sync)
 
-    with tf.GradientTape() as actor_tape:
-      imag_feat = self._imagine_ahead(post)
-      reward = self._reward(imag_feat).mode()
-      if self._c.pcont:
-        pcont = self._pcont(imag_feat).mean()
+    print("(in _train) Post: ")
+    for k in post:
+      print(f"(in _train) Post ({k}): {post[k].shape}")
+
+    print("(in _train) self._dynamics.get_feat(post) shape: ", feat.shape)
+    print("(in _train) data['image'] shape: ", data['image'].shape)
+    print("(in _train) data['reward'] shape: ", data['reward'].shape)
+    print("(in _train) data['action'] shape: ", data['action'].shape)
+
+    num_samples = data['image'].shape[1]
+    actor_loss = None
+
+    for sample in range(num_samples):
+      data_slice = {
+        'image': data['image'][:, sample, :, :, :],
+        'reward': data['reward'][:, sample],
+        'action': data['action'][:, sample, :]
+      }
+      feat, _ = self.get_init_feat(data_slice, None)
+      feat = feat.astype(np.float32)
+      print("(in _train) Feature shape: ", feat.shape)
+      act_pred, img_pred, feat_pred, info = self._plan(None, False, None, feat, verbose=False)
+      if actor_loss is None:
+        actor_loss = info['metrics'].action_violation
       else:
-        pcont = self._c.discount * tf.ones_like(reward)
-      value = self._value(imag_feat).mode()
-      returns = tools.lambda_return(
-          reward[:-1], value[:-1], pcont[:-1],
-          bootstrap=value[-1], lambda_=self._c.disclam, axis=0)
-      discount = tf.stop_gradient(tf.math.cumprod(tf.concat(
-          [tf.ones_like(pcont[:1]), pcont[:-2]], 0), 0))
-      actor_loss = -tf.reduce_mean(discount * returns)
-      actor_loss /= float(self._strategy.num_replicas_in_sync)
+        actor_loss += info['metrics'].action_violation
 
     with tf.GradientTape() as value_tape:
       value_pred = self._value(imag_feat)[:-1]
       target = tf.stop_gradient(returns)
       value_loss = -tf.reduce_mean(discount * value_pred.log_prob(target))
-      value_loss /= float(self._strategy.num_replicas_in_sync)
+      # value_loss /= float(self._strategy.num_replicas_in_sync)
 
     model_norm = self._model_opt(model_tape, model_loss)
-    actor_norm = self._actor_opt(actor_tape, actor_loss)
+    # actor_norm = self._actor_opt(actor_tape, actor_loss)
     value_norm = self._value_opt(value_tape, value_loss)
 
     if tf.distribute.get_replica_context().replica_id_in_sync_group == 0:
       if self._c.log_scalars:
         self._scalar_summaries(
             data, feat, prior_dist, post_dist, likes, div,
-            model_loss, value_loss, actor_loss, model_norm, value_norm,
-            actor_norm)
+            model_loss, value_loss, actor_loss, model_norm, value_norm)
       if tf.equal(log_images, True):
         self._image_summaries(data, embed, image_pred)
 
@@ -226,67 +187,184 @@ class Dreamer(tools.Module):
       self._pcont = models.DenseDecoder(
           (), 3, self._c.num_units, 'binary', act=act)
     self._value = models.DenseDecoder((), 3, self._c.num_units, act=act)
+    
     self._actor = models.ActionDecoder(
         self._actdim, 4, self._c.num_units, self._c.action_dist,
         init_std=self._c.action_init_std, act=act)
+    
+
     model_modules = [self._encode, self._dynamics, self._decode, self._reward]
     if self._c.pcont:
       model_modules.append(self._pcont)
     Optimizer = functools.partial(
         tools.Adam, wd=self._c.weight_decay, clip=self._c.grad_clip,
         wdpattern=self._c.weight_decay_pattern)
+    
     self._model_opt = Optimizer('model', model_modules, self._c.model_lr)
     self._value_opt = Optimizer('value', [self._value], self._c.value_lr)
-    self._actor_opt = Optimizer('actor', [self._actor], self._c.actor_lr)
+    # self._actor_opt = Optimizer('actor', [self._actor], self._c.actor_lr)
+    
     # Do a train step to initialize all variables, including optimizer
     # statistics. Ideally, we would use batch size zero, but that doesn't work
     # in multi-GPU mode.
     self.train(next(self._dataset))
 
-  def _exploration(self, action, training):
-    if training:
-      amount = self._c.expl_amount
-      if self._c.expl_decay:
-        amount *= 0.5 ** (tf.cast(self._step, tf.float32) / self._c.expl_decay)
-      if self._c.expl_min:
-        amount = tf.maximum(self._c.expl_min, amount)
-      self._metrics['expl_amount'].update_state(amount)
-    elif self._c.eval_noise:
-      amount = self._c.eval_noise
-    else:
-      return action
-    if self._c.expl == 'additive_gaussian':
-      return tf.clip_by_value(tfd.Normal(action, amount).sample(), -1, 1)
-    if self._c.expl == 'completely_random':
-      return tf.random.uniform(action.shape, -1, 1)
-    if self._c.expl == 'epsilon_greedy':
-      indices = tfd.Categorical(0 * action).sample()
-      return tf.where(
-          tf.random.uniform(action.shape[:1], 0, 1) < amount,
-          tf.one_hot(indices, action.shape[-1], dtype=self._float),
-          action)
-    raise NotImplementedError(self._c.expl)
+  def pair_residual_func_body(self, x_a, x_b, lam, nu):
+    """ This function is required by the gn_solver. It taking in the pair of adjacent states (current and next state)
+    and outputs the residuals for the Gauss-Newton optimization
+  
+    :param x_a: current states and actions, batched across sequence length
+    :param x_b: next states and actions
+    :param lam: lagrange multiplier for dynamics
+    :param nu: lagrange multiplier for actions
+    :return: a vector of residuals
+    """
+    # Compute residuals
+    actions_a = x_a[:, -self._actdim:][None]
+    feats_a = x_a[:, :-self._actdim][None]
+    states_a = self._dynamics.from_feat(feats_a)
+    prior_a = self._dynamics.img_step(states_a, actions_a)
+    x_b_pred = self._dynamics.get_mean_feat(prior_a)[0]
+    dyn_residual = x_b[:, :-self._actdim] - x_b_pred
+    act_residual = tf.clip_by_value(tf.math.abs(x_a[:, -self._actdim:]) - 1, 0, np.inf)
+    rew = self._reward(x_b[:, :-self._actdim]).mode()[:, None]
+    rew_residual = tf.math.softplus(-rew)
 
-  def _imagine_ahead(self, post):
-    if self._c.pcont:  # Last step could be terminal.
-      post = {k: v[:, :-1] for k, v in post.items()}
-    flatten = lambda x: tf.reshape(x, [-1] + list(x.shape[2:]))
-    start = {k: flatten(v) for k, v in post.items()}
-    policy = lambda state: self._actor(
-        tf.stop_gradient(self._dynamics.get_feat(state))).sample()
-    states = tools.static_scan(
-        lambda prev, _: self._dynamics.img_step(prev, policy(prev)),
-        tf.range(self._c.horizon), start)
-    imag_feat = self._dynamics.get_feat(states)
-    return imag_feat
+    # Compute coefficients
+    dyn_c = tf.sqrt(lam)[:, :, None] * self._c.dyn_loss_scale
+    act_c = tf.sqrt(nu)[:, :, None] * self._c.act_loss_scale
+    rew_c = tf.ones(lam.shape, np.float32)[:, :, None]
+
+    # Normalize with the sum of multipliers to scale the objective in a reasonable range.
+    bs, n = nu.shape[0:2]
+    normalize = 1 / (tf.reduce_mean(dyn_c, 1) + tf.reduce_mean(act_c, 1) + tf.reduce_mean(rew_c, 1))
+    dyn_resw = dyn_c * tf.reshape(dyn_residual, (bs, n, -1))
+    act_resw = act_c * tf.reshape(act_residual, (bs, n, -1))
+    rew_resw = rew_c * tf.reshape(rew_residual, (bs, n, -1))
+    objective = normalize[:, :, None] * tf.concat([dyn_resw, act_resw, rew_resw], 2)
+
+    return tf.reshape(objective, (-1, objective.shape[2]))
+
+  @tf.function
+  def opt_step(self, plan, init_feat, lam, nu):
+    """ One optimization step. This function is needed for the code to compile properly """
+    # We actually also optimize the first state, ensuring it is close to the true first state
+    init_residual_func = lambda x: (x[:, :-self._actdim] - init_feat) * 1000
+    pair_residual_func = lambda x_a, x_b : self.pair_residual_func_body(x_a, x_b, lam, nu)
+    plan = gn_solver.solve_step(pair_residual_func, init_residual_func, plan, damping=self._c.gn_damping)
+    return plan
+
+  def _plan(self, init_obs, save_images, step, init_feat=None, verbose=True):
+    """ The LatCo agent. This function implements the dual descent algorithm. _batch_ optimization procedures are
+    executed in parallel, and the best solution is taken.
+    
+    :param init_obs: Initial observation (either observation of latent has to be specified)
+    :param save_images: Whether to save images
+    :param step: Index to label the saved images with
+    :param init_feat: Initial latent state (either observation of latent has to be specified)
+    """
+    hor = self._c.horizon
+    feat_size = self._c.stoch_size + self._c.deter_size
+    var_len_step = feat_size + self._actdim
+    batch = self._c.batch_size
+    dyn_threshold = self._c.dyn_threshold
+    act_threshold = self._c.act_threshold
+
+    if init_feat is None:
+      init_feat, _ = self.get_init_feat(init_obs)
+    plan = tf.random.normal((batch, (hor + 1) * var_len_step,), dtype=self._float)
+
+    print("(in _plan) Plan shape: ", plan.shape)
+
+    # Set the first state to be the observed initial state
+    plan = tf.concat([tf.repeat(init_feat, batch, 0), plan[:, feat_size:]], 1)
+    plan = tf.reshape(plan, [batch, hor + 1, var_len_step])
+    lam = tf.ones((batch, hor)) * self._c.init_lam
+    nu = tf.ones((batch, hor)) * self._c.init_nu
+
+    print("(in _plan) (After concat) Plan shape: ", plan.shape)
+    plan = plan.astype(np.float32)
+
+    print("(in _plan) Plan type: ", type(plan))
+
+    # Run dual descent
+    plans = [plan]
+    metrics = tools.AttrDefaultDict(list)
+    for i in range(self._c.optimization_steps):
+      # Run Gauss-Newton step
+      plan = self.opt_step(plan, init_feat, lam, nu)
+      plan_res = tf.reshape(plan, [batch, hor+1, -1])
+      feat_preds, act_preds = tf.split(plan_res, [feat_size, self._actdim], 2)
+      states = self._dynamics.from_feat(feat_preds[:, :-1])
+      priors = self._dynamics.img_step(states, act_preds[:, :-1])
+      priors_feat = tf.squeeze(self._dynamics.get_mean_feat(priors))
+      dyn_viol = tf.reduce_sum(tf.square(priors_feat - feat_preds[:, 1:]), 2)
+      act_viol = tf.reduce_sum(tf.clip_by_value(tf.square(act_preds[:, :-1]) - 1, 0, np.inf), 2)
+
+      # Update lagrange multipliers
+      if i % self._c.lm_update_every == self._c.lm_update_every - 1:
+        lam_delta = lam * 0.1 * tf.math.log((dyn_viol + 0.1 * dyn_threshold) / dyn_threshold) / tf.math.log(10.0)
+        nu_delta  = nu * 0.1 * tf.math.log((act_viol + 0.1 * act_threshold) / act_threshold) / tf.math.log(10.0)
+        lam = lam + lam_delta
+        nu = nu + nu_delta
+
+      # Logging
+      act_preds_clipped = tf.clip_by_value(act_preds, -1, 1)
+      metrics.dynamics.append(tf.reduce_sum(dyn_viol))
+      metrics.action_violation.append(tf.reduce_sum(act_viol))
+      metrics.dynamics_coeff.append(self._c.dyn_loss_scale**2 * tf.reduce_sum(lam))
+      metrics.action_coeff.append(self._c.act_loss_scale**2 * tf.reduce_sum(nu))
+      plans.append(plan)
+
+      if self._c.log_colloc_scalars:
+        # Compute and record dynamics loss and reward
+        rew_raw = self._reward(feat_preds).mode()
+        metrics.rewards.append(tf.reduce_sum(rew_raw, 1))
+
+        # Record model rewards
+        model_feats = self._dynamics.imagine_feat(act_preds_clipped[0:1], init_feat, deterministic=True)
+        model_rew = self._reward(model_feats[0:1]).mode()
+        metrics.model_rewards.append(tf.reduce_sum(model_rew))
+
+    # Select best plan
+    model_feats = self._dynamics.imagine_feat(act_preds_clipped, tf.repeat(init_feat, batch, 0), deterministic=False)
+    model_rew = tf.reduce_sum(self._reward(model_feats).mode(), [1])
+    best_plan = tf.argmax(model_rew)
+    predicted_rewards = model_rew[best_plan]
+    metrics.predicted_rewards.append(predicted_rewards)
+
+    # Get action and feature predictions
+    act_preds = act_preds[best_plan, :min(hor, self._c.mpc_steps)]
+    if tf.reduce_any(tf.math.is_nan(act_preds)) or tf.reduce_any(tf.math.is_inf(act_preds)):
+      act_preds = tf.zeros_like(act_preds)
+    feat_preds = feat_preds[best_plan, :min(hor, self._c.mpc_steps)]
+    if self._c.log_colloc_scalars:
+      metrics.rewards = [r[best_plan] for r in metrics.rewards]
+    else:
+      metrics.rewards = [tf.reduce_sum(self._reward(feat_preds).mode())]
+
+    # Logging
+    img_preds = None
+    if save_images:
+      img_preds = self._decode(feat_preds).mode()
+      self.logger.log_graph('losses', {f'{c[0]}/{step}': c[1] for c in metrics.items()})
+      self.visualize_colloc(img_preds, act_preds, init_feat, step)
+    if verbose:
+      if batch > 1:
+        print(f'plan rewards: {model_rew}, best plan: {best_plan}')
+      print(f"Planned average dynamics loss: {metrics.dynamics[-1] / hor}")
+      print(f"Planned average action violation: {metrics.action_violation[-1] / hor}")
+      print(f"Planned total reward: {metrics.predicted_rewards[-1] / hor}")
+    info = {'metrics': tools.map_dict(lambda x: x[-1] / hor if len(x) > 0 else 0, dict(metrics)),
+            'plans': tf.stack(plans, 0)[:, best_plan:best_plan + 1],
+            'curves': dict(metrics)}
+    return act_preds, img_preds, feat_preds, info
 
   def _scalar_summaries(
       self, data, feat, prior_dist, post_dist, likes, div,
-      model_loss, value_loss, actor_loss, model_norm, value_norm,
-      actor_norm):
+      model_loss, value_loss, actor_loss, model_norm, value_norm):
     self._metrics['model_grad_norm'].update_state(model_norm)
     self._metrics['value_grad_norm'].update_state(value_norm)
-    self._metrics['actor_grad_norm'].update_state(actor_norm)
     self._metrics['prior_ent'].update_state(prior_dist.entropy())
     self._metrics['post_ent'].update_state(post_dist.entropy())
     for name, logprob in likes.items():
@@ -324,140 +402,3 @@ class Dreamer(tools.Module):
     [tf.summary.scalar('agent/' + k, m) for k, m in metrics]
     print(f'[{step}]', ' / '.join(f'{k} {v:.1f}' for k, v in metrics))
     self._writer.flush()
-
-
-def preprocess(obs, config):
-  dtype = prec.global_policy().compute_dtype
-  obs = obs.copy()
-  with tf.device('cpu:0'):
-    obs['image'] = tf.cast(obs['image'], dtype) / 255.0 - 0.5
-    clip_rewards = dict(none=lambda x: x, tanh=tf.tanh)[config.clip_rewards]
-    obs['reward'] = clip_rewards(obs['reward'])
-  return obs
-
-
-def count_steps(datadir, config):
-  return tools.count_episodes(datadir)[1] * config.action_repeat
-
-
-def load_dataset(directory, config):
-  episode = next(tools.load_episodes(directory, 1))
-  types = {k: v.dtype for k, v in episode.items()}
-  shapes = {k: (None,) + v.shape[1:] for k, v in episode.items()}
-  generator = lambda: tools.load_episodes(
-      directory, config.train_steps, config.batch_length,
-      config.dataset_balance)
-  dataset = tf.data.Dataset.from_generator(generator, types, shapes)
-  dataset = dataset.batch(config.batch_size, drop_remainder=True)
-  dataset = dataset.map(functools.partial(preprocess, config=config))
-  dataset = dataset.prefetch(10)
-  return dataset
-
-
-def summarize_episode(episode, config, datadir, writer, prefix):
-  episodes, steps = tools.count_episodes(datadir)
-  length = (len(episode['reward']) - 1) * config.action_repeat
-  ret = episode['reward'].sum()
-  print(f'{prefix.title()} episode of length {length} with return {ret:.1f}.')
-  metrics = [
-      (f'{prefix}/return', float(episode['reward'].sum())),
-      (f'{prefix}/length', len(episode['reward']) - 1),
-      (f'episodes', episodes)]
-  step = count_steps(datadir, config)
-  with (config.logdir / 'metrics.jsonl').open('a') as f:
-    f.write(json.dumps(dict([('step', step)] + metrics)) + '\n')
-  with writer.as_default():  # Env might run in a different thread.
-    tf.summary.experimental.set_step(step)
-    [tf.summary.scalar('sim/' + k, v) for k, v in metrics]
-    if prefix == 'test':
-      tools.video_summary(f'sim/{prefix}/video', episode['image'][None])
-
-
-def make_env(config, writer, prefix, datadir, store):
-  suite, task = config.task.split('_', 1)
-  if suite == 'dmc':
-    env = wrappers.DeepMindControl(task)
-    env = wrappers.ActionRepeat(env, config.action_repeat)
-    env = wrappers.NormalizeActions(env)
-  elif suite == 'atari':
-    env = wrappers.Atari(
-        task, config.action_repeat, (64, 64), grayscale=False,
-        life_done=True, sticky_actions=True)
-    env = wrappers.OneHotAction(env)
-  else:
-    raise NotImplementedError(suite)
-  env = wrappers.TimeLimit(env, config.time_limit / config.action_repeat)
-  callbacks = []
-  if store:
-    callbacks.append(lambda ep: tools.save_episodes(datadir, [ep]))
-  callbacks.append(
-      lambda ep: summarize_episode(ep, config, datadir, writer, prefix))
-  env = wrappers.Collect(env, callbacks, config.precision)
-  env = wrappers.RewardObs(env)
-  return env
-
-
-def main(config):
-  if config.gpu_growth:
-    for gpu in tf.config.experimental.list_physical_devices('GPU'):
-      tf.config.experimental.set_memory_growth(gpu, True)
-  assert config.precision in (16, 32), config.precision
-  if config.precision == 16:
-    prec.set_policy(prec.Policy('mixed_float16'))
-  config.steps = int(config.steps)
-  config.logdir.mkdir(parents=True, exist_ok=True)
-  print('Logdir', config.logdir)
-
-  # Create environments.
-  datadir = config.logdir / 'episodes'
-  writer = tf.summary.create_file_writer(
-      str(config.logdir), max_queue=1000, flush_millis=20000)
-  writer.set_as_default()
-  train_envs = [wrappers.Async(lambda: make_env(
-      config, writer, 'train', datadir, store=True), config.parallel)
-      for _ in range(config.envs)]
-  test_envs = [wrappers.Async(lambda: make_env(
-      config, writer, 'test', datadir, store=False), config.parallel)
-      for _ in range(config.envs)]
-  actspace = train_envs[0].action_space
-
-  # Prefill dataset with random episodes.
-  step = count_steps(datadir, config)
-  prefill = max(0, config.prefill - step)
-  print(f'Prefill dataset with {prefill} steps.')
-  random_agent = lambda o, d, _: ([actspace.sample() for _ in d], None)
-  tools.simulate(random_agent, train_envs, prefill / config.action_repeat)
-  writer.flush()
-
-  # Train and regularly evaluate the agent.
-  step = count_steps(datadir, config)
-  print(f'Simulating agent for {config.steps-step} steps.')
-  agent = Dreamer(config, datadir, actspace, writer)
-  if (config.logdir / 'variables.pkl').exists():
-    print('Load checkpoint.')
-    agent.load(config.logdir / 'variables.pkl')
-  state = None
-  while step < config.steps:
-    print('Start evaluation.')
-    tools.simulate(
-        functools.partial(agent, training=False), test_envs, episodes=1)
-    writer.flush()
-    print('Start collection.')
-    steps = config.eval_every // config.action_repeat
-    state = tools.simulate(agent, train_envs, steps, state=state)
-    step = count_steps(datadir, config)
-    agent.save(config.logdir / 'variables.pkl')
-  for env in train_envs + test_envs:
-    env.close()
-
-
-if __name__ == '__main__':
-  try:
-    import colored_traceback
-    colored_traceback.add_hook()
-  except ImportError:
-    pass
-  parser = argparse.ArgumentParser()
-  for key, value in define_config().items():
-    parser.add_argument(f'--{key}', type=tools.args_type(value), default=value)
-  main(parser.parse_args())

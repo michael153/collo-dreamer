@@ -3,10 +3,87 @@ import functools
 import sys
 import threading
 import traceback
+import os
+import re
 
 import gym
 import numpy as np
 from PIL import Image
+
+if 'MUJOCO_RENDERER' in os.environ:
+  RENDERER = os.environ['MUJOCO_RENDERER']
+else:
+  RENDERER = 'glfw'
+
+
+class DreamerEnv():
+
+  LOCK = threading.Lock()
+
+  def __init__(self, action_repeat, width=64):
+    self._action_repeat = action_repeat
+    self._width = width
+    self._size = (self._width, self._width)
+
+  @property
+  def observation_space(self):
+    shape = self._size + (3,)
+    space = gym.spaces.Box(low=0, high=255, shape=shape, dtype=np.uint8)
+    return gym.spaces.Dict({'image': space})
+
+  @property
+  def action_space(self):
+    return self._env.action_space
+
+  def close(self):
+    return self._env.close()
+
+  def reset(self):
+    with self.LOCK:
+      state = self._env.reset()
+    return self._get_obs(state)
+
+  def step(self, action):
+    total_reward = 0.0
+    for step in range(self._action_repeat):
+      state, reward, done, info = self._env.step(action)
+      total_reward += reward
+      if done:
+        break
+    obs = self._get_obs(state)
+    return obs, total_reward, done, info
+
+  def render(self, mode):
+    return self._env.render(mode)
+
+  def _get_obs(self, state):
+    self._offscreen.render(self._width, self._width, -1)
+    image = np.flip(self._offscreen.read_pixels(self._width, self._width)[0], 1)
+
+    obs = {'image': image}
+    if isinstance(state, dict):
+      obs.update(state)
+    else:
+      obs['state'] = state
+    return obs
+
+
+class PointmassEnv(DreamerEnv):
+
+  def __init__(self, task=None, action_repeat=1):
+    super().__init__(action_repeat)
+    from mujoco_py import MjRenderContext
+    from envs.pointmass.pointmass_prob_env import PointmassProb
+    # from envs.pointmass.pointmass_smart_env import Pointmass as PointmassSmart
+    with self.LOCK:
+      task = 'pm_probabilistic_20pc_10nrew_2prew'
+      self._task_keys, task = parse(task, ['(\d*)pc', '(\d*)nrew', '(\d*)prew'])
+      self._env = PointmassProb(int(self._task_keys['Npc']) / 100,
+                                int(self._task_keys['Nnrew']),
+                                int(self._task_keys['Nprew']))
+
+    self._offscreen = MjRenderContext(self._env.sim, True, 0, RENDERER, True)
+    set_camera(self._offscreen.cam, azimuth=0, elevation=90, distance=2.6)
 
 
 class DeepMindControl:
@@ -62,108 +139,26 @@ class DeepMindControl:
     return self._env.physics.render(*self._size, camera_id=self._camera)
 
 
-class Atari:
-
-  LOCK = threading.Lock()
-
-  def __init__(
-      self, name, action_repeat=4, size=(84, 84), grayscale=True, noops=30,
-      life_done=False, sticky_actions=True):
-    import gym
-    version = 0 if sticky_actions else 4
-    name = ''.join(word.title() for word in name.split('_'))
-    with self.LOCK:
-      self._env = gym.make('{}NoFrameskip-v{}'.format(name, version))
-    self._action_repeat = action_repeat
-    self._size = size
-    self._grayscale = grayscale
-    self._noops = noops
-    self._life_done = life_done
-    self._lives = None
-    shape = self._env.observation_space.shape[:2] + (() if grayscale else (3,))
-    self._buffers = [np.empty(shape, dtype=np.uint8) for _ in range(2)]
-    self._random = np.random.RandomState(seed=None)
-
-  @property
-  def observation_space(self):
-    shape = self._size + (1 if self._grayscale else 3,)
-    space = gym.spaces.Box(low=0, high=255, shape=shape, dtype=np.uint8)
-    return gym.spaces.Dict({'image': space})
-
-  @property
-  def action_space(self):
-    return self._env.action_space
-
-  def close(self):
-    return self._env.close()
-
-  def reset(self):
-    with self.LOCK:
-      self._env.reset()
-    noops = self._random.randint(1, self._noops + 1)
-    for _ in range(noops):
-      done = self._env.step(0)[2]
-      if done:
-        with self.LOCK:
-          self._env.reset()
-    self._lives = self._env.ale.lives()
-    if self._grayscale:
-      self._env.ale.getScreenGrayscale(self._buffers[0])
-    else:
-      self._env.ale.getScreenRGB2(self._buffers[0])
-    self._buffers[1].fill(0)
-    return self._get_obs()
-
-  def step(self, action):
-    total_reward = 0.0
-    for step in range(self._action_repeat):
-      _, reward, done, info = self._env.step(action)
-      total_reward += reward
-      if self._life_done:
-        lives = self._env.ale.lives()
-        done = done or lives < self._lives
-        self._lives = lives
-      if done:
-        break
-      elif step >= self._action_repeat - 2:
-        index = step - (self._action_repeat - 2)
-        if self._grayscale:
-          self._env.ale.getScreenGrayscale(self._buffers[index])
-        else:
-          self._env.ale.getScreenRGB2(self._buffers[index])
-    obs = self._get_obs()
-    return obs, total_reward, done, info
-
-  def render(self, mode):
-    return self._env.render(mode)
-
-  def _get_obs(self):
-    if self._action_repeat > 1:
-      np.maximum(self._buffers[0], self._buffers[1], out=self._buffers[0])
-    image = np.array(Image.fromarray(self._buffers[0]).resize(
-        self._size, Image.BILINEAR))
-    image = np.clip(image, 0, 255).astype(np.uint8)
-    image = image[:, :, None] if self._grayscale else image
-    return {'image': image}
-
-
 class Collect:
 
-  def __init__(self, env, callbacks=None, precision=32):
+  def __init__(self, env, callbacks=None, precision=32, save_sparse_reward=False):
     self._env = env
     self._callbacks = callbacks or ()
     self._precision = precision
     self._episode = None
+    self._save_sparse_reward = save_sparse_reward
 
   def __getattr__(self, name):
     return getattr(self._env, name)
 
   def step(self, action):
-    obs, reward, done, info = self._env.step(action)
-    obs = {k: self._convert(v) for k, v in obs.items()}
+    obs_or, reward, done, info = self._env.step(action)
+    obs = {k: self._convert(v) for k, v in obs_or.items()}
     transition = obs.copy()
     transition['action'] = action
     transition['reward'] = reward
+    if self._save_sparse_reward:
+      transition['sparse_reward'] = info.get('success')
     transition['discount'] = info.get('discount', np.array(1 - float(done)))
     self._episode.append(transition)
     if done:
@@ -172,7 +167,7 @@ class Collect:
       info['episode'] = episode
       for callback in self._callbacks:
         callback(episode)
-    return obs, reward, done, info
+    return obs_or, reward, done, info
 
   def reset(self):
     obs = self._env.reset()
@@ -180,6 +175,8 @@ class Collect:
     transition['action'] = np.zeros(self._env.action_space.shape)
     transition['reward'] = 0.0
     transition['discount'] = 1.0
+    if self._save_sparse_reward:
+      transition['sparse_reward'] = 0.0
     self._episode = [transition]
     return obs
 
@@ -267,70 +264,6 @@ class NormalizeActions:
     return self._env.step(original)
 
 
-class ObsDict:
-
-  def __init__(self, env, key='obs'):
-    self._env = env
-    self._key = key
-
-  def __getattr__(self, name):
-    return getattr(self._env, name)
-
-  @property
-  def observation_space(self):
-    spaces = {self._key: self._env.observation_space}
-    return gym.spaces.Dict(spaces)
-
-  @property
-  def action_space(self):
-    return self._env.action_space
-
-  def step(self, action):
-    obs, reward, done, info = self._env.step(action)
-    obs = {self._key: np.array(obs)}
-    return obs, reward, done, info
-
-  def reset(self):
-    obs = self._env.reset()
-    obs = {self._key: np.array(obs)}
-    return obs
-
-
-class OneHotAction:
-
-  def __init__(self, env):
-    assert isinstance(env.action_space, gym.spaces.Discrete)
-    self._env = env
-
-  def __getattr__(self, name):
-    return getattr(self._env, name)
-
-  @property
-  def action_space(self):
-    shape = (self._env.action_space.n,)
-    space = gym.spaces.Box(low=0, high=1, shape=shape, dtype=np.float32)
-    space.sample = self._sample_action
-    return space
-
-  def step(self, action):
-    index = np.argmax(action).astype(int)
-    reference = np.zeros_like(action)
-    reference[index] = 1
-    if not np.allclose(reference, action):
-      raise ValueError(f'Invalid one-hot action:\n{action}')
-    return self._env.step(index)
-
-  def reset(self):
-    return self._env.reset()
-
-  def _sample_action(self):
-    actions = self._env.action_space.n
-    index = self._random.randint(0, actions)
-    reference = np.zeros(actions, dtype=np.float32)
-    reference[index] = 1.0
-    return reference
-
-
 class RewardObs:
 
   def __init__(self, env):
@@ -355,7 +288,6 @@ class RewardObs:
     obs = self._env.reset()
     obs['reward'] = 0.0
     return obs
-
 
 class Async:
 
@@ -474,3 +406,56 @@ class Async:
       print(f'Error in environment process: {stacktrace}')
       conn.send((self._EXCEPTION, stacktrace))
     conn.close()
+
+def parse(spec, options):
+  """Parses a spec string given a list of options. This can use parametric options, e.g.
+  parse(s, ['targetrew(\d*)x']). They can be accessed as e.g. targetrewNx.
+
+  :param spec: a string separated by underscore, e.g. kitchen_microwave_fullstaterev_topviewcent.
+  It will be parsed to determine whether any of the spec elements match an option.
+  :param options: a list of regular expressions that will be matched against the spec elements. They will be matched  exactly.
+  :return: a dictionary of truth values for each option, and a spec string with all parsed elements removed.
+  """
+
+  opt_names = [o.replace('(\d*)', 'N') for o in options]
+  options = [re.compile('^' + o + '$') for o in options]
+
+  # Parse
+  spec_list = [s for s in spec.split('_') if any(o.search(s) for o in options)]
+
+  def parse_option(o):
+    match = any_obj(o.match(s) for s in spec_list)
+    if not match:
+      return False
+    if len(match.groups()) == 0:
+      return True
+    return match.groups()[0]
+
+  matches = [parse_option(o) for o in options]
+  keys = dict((n, m) for n, m in zip(opt_names, matches))
+
+  # Remove keys from name
+  spec = '_'.join([s for s in spec.split('_') if s not in spec_list])
+  return keys, spec
+
+
+def any_obj(l):
+  l = list(l)
+  nonzero = np.nonzero(l)[0]
+  if len(nonzero) > 0:
+    return l[nonzero[0]]
+  else:
+    return False
+
+
+def set_camera(cam, azimuth=None, elevation=None, distance=None, lookat=None):
+    """ Sets camera parameters """
+    if azimuth:
+        cam.azimuth = azimuth
+    if elevation:
+        cam.elevation = elevation
+    if distance:
+        cam.distance = distance
+    if lookat:
+        for i in range(3):
+            cam.lookat[i] = lookat[i]
